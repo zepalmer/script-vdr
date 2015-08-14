@@ -1,0 +1,140 @@
+#!/usr/bin/python
+
+# A script for recording the virtual desktop information of a process's windows.
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+DATA_FILE = os.environ["HOME"] + "/.vdr.data"
+
+class SubprocessError(Exception):
+    def __init__(self, *args):
+        Exception.__init__(self, *args)
+
+def parse_args():
+    """
+    Parses and digests command-line arguments.
+    """
+    parser = argparse.ArgumentParser(description="Record virtual desktop of a process's windows.")
+    parser.add_argument('pid', metavar='PID', type=int, help="The PID of the process.")
+    parser.add_argument('--load', action='store_const', const=True, default=False,
+                        help="Loads the virtual desktop for a process.")
+    parser.add_argument('--save', action='store_const', const=True, default=False,
+                        help="Saves the virtual desktop for a process.")
+    parser.add_argument('--name', help="The name to use for the process.  Defaults to the value of /proc/self/exe")
+
+    def display_help_and_exit(msg=None):
+        if msg:
+            print(msg)
+            print("")
+        parser.print_help()
+        sys.exit(0 if msg is None else 1)
+
+    args = parser.parse_args()
+
+    if not args.load and not args.save:
+        display_help_and_exit("One of --load or --save must be specified.")
+
+    if args.load and args.save:
+        display_help_and_exit("Only one of --load or --save may be specified.")
+        
+    if not os.path.exists("/proc/%d" % args.pid):
+        print("Invalid PID: %d" % args.pid)
+        sys.exit(2)
+        
+    name = args.name if args.name else os.path.realpath("/proc/%d/exe" % args.pid)
+        
+    return {"pid": args.pid,
+            "action": "load" if args.load else "save",
+            "name": name}
+
+def load_data():
+    """
+    Loads window data from the data file.
+    """
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE) as f:
+            return json.load(f)
+    else:
+        return {}
+
+def save_data(data):
+    """
+    Saves window data to the data file.  This function completely replaces the
+    data file's contents.
+    """
+    with open(DATA_FILE,'w') as f:
+        return json.dump(data,f,indent=4,sort_keys=True)
+    
+def get_window_data(pid):
+    """
+    Retrieves window data for a particular PID.
+    """
+    p = subprocess.Popen(["wmctrl","-G","-l","-p"],
+                         stdin=None,stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT,close_fds=True)
+    (out,_) = p.communicate()
+    if p.returncode != 0:
+        raise SubprocessError("wmctrl gave non-zero return code %d" % p.returncode)
+    
+    windows_for_pid = {}
+    for line in out.split('\n'):
+        line = line.strip()
+        if not line: continue
+        cols = re.split('\s+', line, maxsplit=8)
+        window_id = cols[0]
+        desktop_id = int(cols[1])
+        window_pid = int(cols[2])
+        title = cols[8].decode('utf-8')
+        if window_pid != pid:
+            continue
+        windows_for_pid[title] = {"desktop": desktop_id, "window_id": window_id}
+    
+    return windows_for_pid
+
+def set_desktop_for(window_id, desktop_id):
+    """
+    Changes the desktop of a window by its ID.
+    """
+    subprocess.call(["wmctrl","-i","-r",window_id,"-t",str(desktop_id)])
+    
+def save_action(pid, name):
+    """
+    The main routine for the --save mode.
+    """
+    application_data = load_data()
+    new_windows_for_pid = get_window_data(pid)
+    windows_for_pid = application_data.get(name, {})
+    for value in new_windows_for_pid.values():
+        del value["window_id"]
+    windows_for_pid.update(new_windows_for_pid)
+    application_data[name] = windows_for_pid
+    save_data(application_data)
+
+def load_action(pid, name):
+    """
+    The main routine for the --load mode.
+    """
+    application_data = load_data()
+    windows_for_pid = get_window_data(pid)
+    window_data = application_data.get(name, {})
+    for window_title in windows_for_pid.keys():
+        try:
+            desktop_id = window_data[window_title]["desktop"]
+        except KeyError:
+            continue
+        window_id = windows_for_pid[window_title]["window_id"]
+        set_desktop_for(window_id, desktop_id)
+
+def main():
+    configuration = parse_args()
+    if configuration["action"] == "load":
+        load_action(configuration["pid"], configuration["name"])
+    else:
+        save_action(configuration["pid"], configuration["name"])
+
+main()
